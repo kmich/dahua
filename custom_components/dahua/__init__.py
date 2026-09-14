@@ -1140,10 +1140,52 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
             # debug-logging instructions for what is often a one-word answer.
             raise UpdateFailed(detail) from exception
 
+    def _process_plate_event(self, event: dict) -> None:
+        """Process license plate data from event if present, updating sensors and firing events."""
+        plate_info = dahua_utils.extract_plate_data(event)
+        if plate_info and plate_info.get("plate"):
+            plate_info["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            self._last_plate_data = plate_info
+            self._last_plate_timestamp = int(time.time())
+            event["PlateNumber"] = plate_info["plate"]
+            event["PlateData"] = plate_info
+            _LOGGER.info(
+                "Dahua ANPR Plate detected on %s: %s (event %s)",
+                self.get_device_name(),
+                plate_info["plate"],
+                event.get("Code"),
+            )
+            # Dedicated event on Home Assistant event bus
+            anpr_event_data = {
+                "device_name": self.get_device_name(),
+                "channel": self._channel,
+                "plate": plate_info["plate"],
+                "raw_plate": plate_info.get("raw_plate"),
+                "confidence": plate_info.get("confidence"),
+                "vehicle_type": plate_info.get("vehicle_type"),
+                "vehicle_color": plate_info.get("vehicle_color"),
+                "vehicle_brand": plate_info.get("vehicle_brand"),
+                "vehicle_series": plate_info.get("vehicle_series"),
+                "direction": plate_info.get("direction"),
+                "is_authorized": self.is_plate_authorized(plate_info["plate"]),
+                "raw_event_code": event.get("Code"),
+                "timestamp": self._last_plate_timestamp,
+            }
+            self.hass.bus.fire(EVENT_DAHUA_ANPR_RECOGNIZED, anpr_event_data)
+
+            for listener in self._plate_listeners:
+                try:
+                    listener()
+                except Exception as ex:
+                    _LOGGER.warning("Error calling plate listener: %s", ex)
+
     def on_receive_vto_event(self, event: dict):
         event["DeviceName"] = self.get_device_name()
         _LOGGER.debug(f"VTO Data received: {event}")
         self.hass.bus.fire("dahua_event_received", event)
+
+        # Check for license plate data in the event
+        self._process_plate_event(event)
 
         # Example events:
         # {
@@ -1253,42 +1295,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         )
 
         # Check for license plate data in the event
-        plate_info = dahua_utils.extract_plate_data(event)
-        if plate_info and plate_info.get("plate"):
-            plate_info["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-            self._last_plate_data = plate_info
-            self._last_plate_timestamp = int(time.time())
-            event["PlateNumber"] = plate_info["plate"]
-            event["PlateData"] = plate_info
-            _LOGGER.info(
-                "Dahua ANPR Plate detected on %s: %s (event %s)",
-                self.get_device_name(),
-                plate_info["plate"],
-                event.get("Code"),
-            )
-            # Dedicated event on Home Assistant event bus
-            anpr_event_data = {
-                "device_name": self.get_device_name(),
-                "channel": self._channel,
-                "plate": plate_info["plate"],
-                "raw_plate": plate_info.get("raw_plate"),
-                "confidence": plate_info.get("confidence"),
-                "vehicle_type": plate_info.get("vehicle_type"),
-                "vehicle_color": plate_info.get("vehicle_color"),
-                "vehicle_brand": plate_info.get("vehicle_brand"),
-                "vehicle_series": plate_info.get("vehicle_series"),
-                "direction": plate_info.get("direction"),
-                "is_authorized": self.is_plate_authorized(plate_info["plate"]),
-                "raw_event_code": event.get("Code"),
-                "timestamp": self._last_plate_timestamp,
-            }
-            self.hass.bus.fire(EVENT_DAHUA_ANPR_RECOGNIZED, anpr_event_data)
-
-            for listener in self._plate_listeners:
-                try:
-                    listener()
-                except Exception as ex:
-                    _LOGGER.warning("Error calling plate listener: %s", ex)
+        self._process_plate_event(event)
 
         # Put the event on the HA event bus
         event["name"] = self.get_device_name()
@@ -1391,8 +1398,14 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
     def is_doorbell(self) -> bool:
         """ Returns true if this is a doorbell (VTO) """
         m = self.model.upper()
-        return m.startswith("VTO") or m.startswith("DH-VTO") or (
-            "NVR" not in m and m.startswith("DHI")) or self.is_amcrest_doorbell() or self.is_empiretech_doorbell() or self.is_avaloidgoliath_doorbell()
+        return (
+            m.startswith(("VTO", "DH-VTO", "DHI-VTO", "DH_VTO", "DHI_VTO"))
+            or "-VTO" in m
+            or "_VTO" in m
+            or self.is_amcrest_doorbell()
+            or self.is_empiretech_doorbell()
+            or self.is_avaloidgoliath_doorbell()
+        )
 
     def is_amcrest_doorbell(self) -> bool:
         """ Returns true if this is an Amcrest doorbell - IMOU DB61i is identical """
